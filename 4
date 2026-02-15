@@ -1,0 +1,318 @@
+# ============================================================
+# Semantic analysis of LLM rationales vs class definitions
+# For 4 models: GPT-5 Full, GPT-5 mini, Gemini Pro, Gemini 2.5 Flash
+#
+# Inputs (your CSVs):
+#   result-GPT5-Full.csv
+#   result-gpt-5-mini.csv
+#   result-Geminipro.csv
+#   result-gemini-2.5-flash.csv
+#
+# Outputs:
+#   semantic_reasoning_outputs/
+#     tables/*.csv
+#     figures/*.png
+#     semantic_reasoning_summary.xlsx
+#
+# Requirements:
+#   pip install pandas numpy scikit-learn matplotlib openpyxl
+# ============================================================
+
+import os
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+
+# ---------------------------
+# 1) CONFIG
+# ---------------------------
+
+FILES = {
+    "GPT-5 Full": "result-GPT5-Full.csv",
+    "GPT-5 mini": "result-gpt-5-mini.csv",
+    "Gemini Pro": "result-Geminipro.csv",
+    "Gemini 2.5 Flash": "result-gemini-2.5-flash.csv",
+}
+
+LABELS = [
+    "AI Adoption Factors",
+    "AI Development and Methods",
+    "AI Economic and Business Impacts",
+    "AI Performance Evaluation",
+    "Not Related",
+    "Uncertain",
+]
+
+# Operational class definitions (semantic anchors)
+CLASS_DEF = {
+    "AI Development and Methods": (
+        "Primary contribution is developing or adapting AI/ML methods, algorithms, architectures, pipelines, "
+        "or data workflows for construction tasks (e.g., model design, feature engineering, BIM integration, optimization)."
+    ),
+    "AI Performance Evaluation": (
+        "Primary contribution is validating, benchmarking, or comparing AI/ML approaches using experiments, metrics, "
+        "baselines, ablation, or performance assessment on construction-related data or tasks."
+    ),
+    "AI Adoption Factors": (
+        "Primary contribution is explaining drivers, barriers, enablers, readiness, governance, skills, trust, "
+        "or organizational factors affecting adoption of AI/ML in construction."
+    ),
+    "AI Economic and Business Impacts": (
+        "Primary contribution is analyzing economic/business impacts of AI/ML in construction such as ROI, cost-benefit, "
+        "productivity, competitiveness, business value, or investment implications."
+    ),
+    "Not Related": (
+        "AI/ML is not substantively applied to construction, or construction context is absent; any AI mention is peripheral."
+    ),
+    "Uncertain": (
+        "Insufficient information to verify AI/ML use in construction from the abstract; terminology is vague or unclear."
+    ),
+}
+
+OUT_DIR = "semantic_reasoning_outputs"
+TAB_DIR = os.path.join(OUT_DIR, "tables")
+FIG_DIR = os.path.join(OUT_DIR, "figures")
+os.makedirs(TAB_DIR, exist_ok=True)
+os.makedirs(FIG_DIR, exist_ok=True)
+
+
+# ---------------------------
+# 2) HELPERS
+# ---------------------------
+
+def extract_eid(link: str) -> str | None:
+    if not isinstance(link, str):
+        return None
+    m = re.search(r"eid=([^&]+)", link)
+    return m.group(1) if m else None
+
+def clean_text(x: str) -> str:
+    if not isinstance(x, str):
+        return ""
+    x = x.strip()
+    x = re.sub(r"\s+", " ", x)
+    return x
+
+def load_one(model_name: str, fp: str) -> pd.DataFrame:
+    df = pd.read_csv(fp).copy()
+    # stable id: prefer EID from Link; fallback to row index
+    eid = df["Link"].apply(extract_eid) if "Link" in df.columns else None
+    if eid is None:
+        df["DocID"] = "row:" + df.index.astype(str)
+    else:
+        df["DocID"] = np.where(
+            eid.notna(),
+            "eid:" + eid.astype(str),
+            "row:" + df.index.astype(str),
+        )
+    out = pd.DataFrame({
+        "Model": model_name,
+        "DocID": df["DocID"],
+        "AI_Category": df["AI_Category"].astype(str).str.strip(),
+        "AI_Confidence": pd.to_numeric(df.get("AI_Confidence", np.nan), errors="coerce"),
+        "AI_Reason": df["AI_Reason"].fillna("").astype(str).map(clean_text),
+    })
+    # keep valid rows
+    out = out[(out["AI_Reason"].str.len() > 0) & (out["AI_Category"].isin(LABELS))].copy()
+    return out
+
+
+# ---------------------------
+# 3) CORE SEMANTIC ANALYSIS
+# ---------------------------
+
+def semantic_anchor_analysis(df: pd.DataFrame, tag: str) -> dict:
+    """
+    Computes:
+      - DefSim_Assigned: cosine(rationale, definition_of_assigned_class)
+      - DefSim_MaxOther: best alternative similarity
+      - DefSim_Margin:   assigned - best alternative
+      - DefSim_ArgmaxMatch: rationale closest to assigned class definition?
+    """
+
+    reasons = df["AI_Reason"].tolist()
+    defs = [CLASS_DEF[l] for l in LABELS]
+    corpus = reasons + defs
+
+    vect = TfidfVectorizer(
+        stop_words="english",
+        ngram_range=(1, 2),
+        min_df=1,
+        max_features=30000,
+    )
+    X = vect.fit_transform(corpus)
+    Xr = X[:len(reasons)]
+    Xd = X[len(reasons):]
+
+    sims = cosine_similarity(Xr, Xd)  # n_docs x n_labels
+    sims_df = pd.DataFrame(sims, columns=LABELS, index=df.index)
+
+    assigned = df["AI_Category"].astype(str).values
+    assigned_sim = np.array([sims_df.iloc[i][lab] for i, lab in enumerate(assigned)], dtype=float)
+    max_other = np.array([float(sims_df.iloc[i].drop(index=lab).max()) for i, lab in enumerate(assigned)], dtype=float)
+    margin = assigned_sim - max_other
+
+    argmax_label = np.array(LABELS)[sims_df.values.argmax(axis=1)]
+    argmax_match = (argmax_label == assigned)
+
+    out = df.copy()
+    out["DefSim_Assigned"] = assigned_sim
+    out["DefSim_MaxOther"] = max_other
+    out["DefSim_Margin"] = margin
+    out["DefSim_ArgmaxLabel"] = argmax_label
+    out["DefSim_ArgmaxMatch"] = argmax_match
+
+    # Model-level summary
+    model_summary = out.groupby("Model").agg(
+        n=("AI_Reason", "size"),
+        mean_assigned=("DefSim_Assigned", "mean"),
+        median_assigned=("DefSim_Assigned", "median"),
+        mean_margin=("DefSim_Margin", "mean"),
+        median_margin=("DefSim_Margin", "median"),
+        argmax_match_rate=("DefSim_ArgmaxMatch", "mean"),
+        avg_conf=("AI_Confidence", "mean"),
+    ).reset_index()
+
+    # Model × Class summary
+    class_model = out.groupby(["Model", "AI_Category"]).agg(
+        n=("AI_Reason", "size"),
+        mean_assigned=("DefSim_Assigned", "mean"),
+        mean_margin=("DefSim_Margin", "mean"),
+        argmax_match_rate=("DefSim_ArgmaxMatch", "mean"),
+        avg_conf=("AI_Confidence", "mean"),
+    ).reset_index().rename(columns={"AI_Category": "Class"})
+
+    # Pairwise model similarity (centroid cosine) within each class, averaged across classes
+    ms = sorted(out["Model"].unique())
+    centroids = {}
+    for m in ms:
+        for c in LABELS:
+            mask = (out["Model"] == m) & (out["AI_Category"] == c)
+            if mask.sum() == 0:
+                continue
+            centroids[(m, c)] = Xr[mask.values].mean(axis=0)
+
+    sim_mat = pd.DataFrame(index=ms, columns=ms, dtype=float)
+    for i, m1 in enumerate(ms):
+        for j, m2 in enumerate(ms):
+            if m1 == m2:
+                sim_mat.loc[m1, m2] = 1.0
+            elif i < j:
+                vals = []
+                for c in LABELS:
+                    if (m1, c) in centroids and (m2, c) in centroids:
+                        vals.append(float(cosine_similarity(centroids[(m1, c)], centroids[(m2, c)])[0, 0]))
+                sim_mat.loc[m1, m2] = sim_mat.loc[m2, m1] = (float(np.mean(vals)) if vals else np.nan)
+
+    # Drift examples: rationales whose closest definition != assigned label
+    drift = out.loc[~out["DefSim_ArgmaxMatch"], [
+        "Model", "DocID", "AI_Category", "DefSim_ArgmaxLabel",
+        "DefSim_Assigned", "DefSim_MaxOther", "DefSim_Margin", "AI_Reason"
+    ]].sort_values("DefSim_Margin", ascending=True).head(50)
+
+    # Save tables
+    model_summary.to_csv(os.path.join(TAB_DIR, f"{tag}__model_summary.csv"), index=False)
+    class_model.to_csv(os.path.join(TAB_DIR, f"{tag}__class_model_summary.csv"), index=False)
+    sim_mat.to_csv(os.path.join(TAB_DIR, f"{tag}__model_similarity_centroids.csv"))
+    drift.to_csv(os.path.join(TAB_DIR, f"{tag}__semantic_drift_top50.csv"), index=False)
+
+    # ---------------------------
+    # Figures (no custom colors)
+    # ---------------------------
+
+    # Fig1: Semantic consistency
+    msu = model_summary.sort_values("argmax_match_rate", ascending=False)
+    plt.figure(figsize=(8.8, 4.2))
+    plt.bar(msu["Model"], msu["argmax_match_rate"])
+    plt.title(f"Semantic consistency (argmax definition = assigned label) — {tag}")
+    plt.ylabel("Argmax match rate")
+    plt.xticks(rotation=20, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, f"{tag}__Fig1_ArgmaxMatchRate.png"), dpi=240)
+    plt.close()
+
+    # Fig2: Assigned similarity distribution
+    plt.figure(figsize=(9.2, 4.8))
+    data = [out.loc[out["Model"] == m, "DefSim_Assigned"].dropna().values for m in ms]
+    plt.boxplot(data, labels=ms, showfliers=False)
+    plt.title(f"Assigned-definition similarity distribution — {tag}")
+    plt.ylabel("Cosine similarity (TF-IDF)")
+    plt.xticks(rotation=20, ha="right")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, f"{tag}__Fig2_AssignedSim_Boxplot.png"), dpi=240)
+    plt.close()
+
+    # Fig3: Mean alignment heatmap (model × class)
+    pivot = class_model.pivot(index="Model", columns="Class", values="mean_assigned").reindex(ms).reindex(columns=LABELS)
+    plt.figure(figsize=(11.2, 4.6))
+    plt.imshow(pivot.values, aspect="auto")
+    plt.title(f"Mean rationale→definition alignment (model × class) — {tag}")
+    plt.xticks(range(len(LABELS)), LABELS, rotation=35, ha="right")
+    plt.yticks(range(len(ms)), ms)
+    for i in range(pivot.shape[0]):
+        for j in range(pivot.shape[1]):
+            v = pivot.values[i, j]
+            s = "" if (v != v) else f"{v:.2f}"
+            plt.text(j, i, s, ha="center", va="center", fontsize=8)
+    plt.colorbar(label="Mean cosine similarity")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, f"{tag}__Fig3_AlignmentHeatmap.png"), dpi=240)
+    plt.close()
+
+    # Fig4: Model-to-model similarity heatmap (centroid cosine)
+    plt.figure(figsize=(7.2, 6.0))
+    plt.imshow(sim_mat.values, aspect="auto")
+    plt.title(f"Model-to-model semantic similarity (centroids) — {tag}")
+    plt.xticks(range(len(ms)), ms, rotation=30, ha="right")
+    plt.yticks(range(len(ms)), ms)
+    for i in range(len(ms)):
+        for j in range(len(ms)):
+            v = sim_mat.values[i, j]
+            s = "" if (v != v) else f"{v:.2f}"
+            plt.text(j, i, s, ha="center", va="center", fontsize=9)
+    plt.colorbar(label="Cosine similarity")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, f"{tag}__Fig4_ModelSimilarityHeatmap.png"), dpi=240)
+    plt.close()
+
+    return {
+        "out": out,
+        "model_summary": model_summary,
+        "class_model": class_model,
+        "model_similarity": sim_mat,
+        "drift": drift,
+    }
+
+
+# ---------------------------
+# 4) RUN
+# ---------------------------
+
+all_frames = [load_one(name, fp) for name, fp in FILES.items()]
+df_all = pd.concat(all_frames, ignore_index=True)
+
+# Fair comparison subset: docs where all 4 models produced a rationale
+doc_counts = df_all.groupby("DocID")["Model"].nunique()
+common_docids = doc_counts[doc_counts == len(FILES)].index
+df_common = df_all[df_all["DocID"].isin(common_docids)].copy()
+
+res_all = semantic_anchor_analysis(df_all, "AllRecords")
+res_common = semantic_anchor_analysis(df_common, "Common1804")
+
+# Excel convenience workbook
+xlsx_path = os.path.join(OUT_DIR, "semantic_reasoning_summary.xlsx")
+with pd.ExcelWriter(xlsx_path, engine="openpyxl") as w:
+    res_all["model_summary"].to_excel(w, sheet_name="All_model", index=False)
+    res_all["class_model"].to_excel(w, sheet_name="All_class_model", index=False)
+    res_all["model_similarity"].to_excel(w, sheet_name="All_model_similarity")
+    res_common["model_summary"].to_excel(w, sheet_name="Common_model", index=False)
+    res_common["class_model"].to_excel(w, sheet_name="Common_class_model", index=False)
+    res_common["model_similarity"].to_excel(w, sheet_name="Common_model_similarity")
+
+print("Done. Outputs written to:", OUT_DIR)
+print("Excel summary:", xlsx_path)
