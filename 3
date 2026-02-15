@@ -1,0 +1,706 @@
+# ============================================================
+# LLM vs Human Classification + Reasoning Similarity Pipeline
+# Primary evaluation: HighConf only (human consensus 3-0 & 2-1)
+#
+# Outputs:
+#   outputs/
+#     tables/*.csv
+#     figures/*.png
+#     report_summary.xlsx
+#
+# Requirements:
+#   pip install pandas numpy scikit-learn matplotlib openpyxl scipy
+# ============================================================
+
+from __future__ import annotations
+
+import os
+import re
+import glob
+import itertools
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    cohen_kappa_score,
+    confusion_matrix,
+)
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+import matplotlib.pyplot as plt
+
+# -----------------------------
+# 0) CONFIG
+# -----------------------------
+
+@dataclass
+class AgentSpec:
+    name: str
+    path: str
+    kind: str  # "human" or "ai"
+    # If your columns differ, set these explicitly.
+    col_label: Optional[str] = None
+    col_conf: Optional[str] = None
+    col_reason: Optional[str] = None
+
+
+CONFIG = {
+    # Preferred: use DOI, else EID extracted from Scopus Link, else fallback hash
+    "id_priority": ["doi", "eid", "title_year_hash"],
+
+    # HighConf definition: majority votes must be >=2 AND all three humans present
+    "require_all_humans_present_for_highconf": True,
+
+    # Composite similarity weights (classification vs reasoning)
+    "w_class": 0.60,
+    "w_reason": 0.40,
+
+    # Reasoning vectorizer settings
+    "tfidf_min_df": 2,
+    "tfidf_max_features": 20000,
+    "tfidf_ngram_range": (1, 2),
+
+    # Output directory
+    "out_dir": "outputs",
+
+    # Optional: map labels that differ by formatting/synonyms
+    # Example:
+    # "Not related" -> "Not Related"
+    "label_normalization_map": {
+        "not related": "Not Related",
+        "not relevant": "Not Related",
+        "irrelevant": "Not Related",
+    },
+}
+
+# ---- Put your real file paths here ----
+# If you keep files in a folder, just point to them.
+AGENTS: List[AgentSpec] = [
+    # Humans (Excel)
+    AgentSpec(
+        name="Human_Sherwin",
+        path="14_march_Classify-R05-Full-Shervin.xlsx",
+        kind="human",
+        # If known, set explicit columns; otherwise auto-detect
+        col_label=None,
+        col_conf=None,
+        col_reason=None,
+    ),
+    AgentSpec(
+        name="Human_Razieh",
+        path="scopus_4_April_ClassificationComplete_Razieh.xlsx",
+        kind="human",
+        col_label=None,
+        col_conf=None,
+        col_reason=None,
+    ),
+    AgentSpec(
+        name="Human_Mahmuda",
+        path="scopus_All complete_31.3.27_mahmuda.xlsx",
+        kind="human",
+        col_label=None,
+        col_conf=None,
+        col_reason=None,
+    ),
+
+    # AI (CSV)
+    AgentSpec(
+        name="GPT5_Full",
+        path="result-GPT5-Full.csv",
+        kind="ai",
+        col_label="AI_Category",
+        col_conf="AI_Confidence",
+        col_reason="AI_Reason",
+    ),
+    AgentSpec(
+        name="GPT5_Mini",
+        path="result-gpt-5-mini.csv",
+        kind="ai",
+        col_label="AI_Category",
+        col_conf="AI_Confidence",
+        col_reason="AI_Reason",
+    ),
+    AgentSpec(
+        name="Gemini_Pro",
+        path="result-Geminipro.csv",
+        kind="ai",
+        col_label="AI_Category",
+        col_conf="AI_Confidence",
+        col_reason="AI_Reason",
+    ),
+    AgentSpec(
+        name="Gemini_2_5_Flash",
+        path="result-gemini-2.5-flash.csv",
+        kind="ai",
+        col_label="AI_Category",
+        col_conf="AI_Confidence",
+        col_reason="AI_Reason",
+    ),
+]
+
+
+# -----------------------------
+# 1) I/O + STANDARDIZATION
+# -----------------------------
+
+def ensure_outdirs(base: str) -> Dict[str, str]:
+    tables = os.path.join(base, "tables")
+    figs = os.path.join(base, "figures")
+    os.makedirs(tables, exist_ok=True)
+    os.makedirs(figs, exist_ok=True)
+    return {"base": base, "tables": tables, "figs": figs}
+
+
+def find_file(path_or_name: str) -> str:
+    """
+    Allows you to pass either:
+      - exact path
+      - filename in current folder
+      - filename somewhere under cwd (via glob)
+    """
+    if os.path.exists(path_or_name):
+        return path_or_name
+
+    # Try in current directory
+    if os.path.exists(os.path.join(os.getcwd(), path_or_name)):
+        return os.path.join(os.getcwd(), path_or_name)
+
+    # Try recursive search
+    hits = glob.glob(f"**/{path_or_name}", recursive=True)
+    if hits:
+        return hits[0]
+
+    raise FileNotFoundError(f"Could not find: {path_or_name}")
+
+
+def parse_eid_from_link(link: str) -> Optional[str]:
+    if not isinstance(link, str):
+        return None
+    m = re.search(r"eid=(2-s2\.0-\d+)", link)
+    return m.group(1) if m else None
+
+
+def normalize_doi(doi: str) -> Optional[str]:
+    if not isinstance(doi, str) or not doi.strip():
+        return None
+    d = doi.strip().lower()
+    # remove common URL prefix if present
+    d = re.sub(r"^https?://(dx\.)?doi\.org/", "", d)
+    return d
+
+
+def normalize_label(x: str) -> Optional[str]:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    s_low = s.lower().strip()
+    return CONFIG["label_normalization_map"].get(s_low, s)
+
+
+def make_title_year_hash(title: str, year: str) -> str:
+    t = (title or "").strip().lower()
+    y = (year or "").strip()
+    base = (t + "|" + y).encode("utf-8", errors="ignore")
+    # simple stable hash (not cryptographic)
+    return str(abs(hash(base)))
+
+
+def infer_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = list(df.columns)
+    cols_low = {c.lower(): c for c in cols}
+
+    # exact-ish match
+    for cand in candidates:
+        if cand.lower() in cols_low:
+            return cols_low[cand.lower()]
+
+    # contains match
+    for c in cols:
+        cl = c.lower()
+        for cand in candidates:
+            if cand.lower() in cl:
+                return c
+    return None
+
+
+def load_agent(spec: AgentSpec) -> pd.DataFrame:
+    file_path = find_file(spec.path)
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext in [".xlsx", ".xls"]:
+        df = pd.read_excel(file_path)
+    elif ext == ".csv":
+        df = pd.read_csv(file_path)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+
+    # ---- infer common metadata columns ----
+    col_doi = infer_column(df, ["DOI", "doi"])
+    col_link = infer_column(df, ["Link", "link", "scopus link"])
+    col_title = infer_column(df, ["Title", "title", "Document Title"])
+    col_year = infer_column(df, ["Year", "year", "Publication Year"])
+
+    # ---- infer label/conf/reason ----
+    col_label = spec.col_label or infer_column(df, ["Human_Category", "Category", "Class", "Label", "Final Category"])
+    col_conf = spec.col_conf or infer_column(df, ["Human_Confidence", "Confidence", "Conf", "Certainty"])
+    col_reason = spec.col_reason or infer_column(df, ["Human_Reason", "Reason", "Reasoning", "Rationale", "Justification", "Notes"])
+
+    # Log what we inferred (useful when you run)
+    print(f"\n[{spec.name}] Loaded: {file_path}")
+    print(f"  inferred DOI={col_doi}, Link={col_link}, Title={col_title}, Year={col_year}")
+    print(f"  inferred Label={col_label}, Conf={col_conf}, Reason={col_reason}")
+
+    # Build record_id
+    doi_norm = df[col_doi].apply(normalize_doi) if col_doi else pd.Series([None] * len(df))
+    eid = df[col_link].apply(parse_eid_from_link) if col_link else pd.Series([None] * len(df))
+
+    title = df[col_title].astype(str) if col_title else pd.Series([""] * len(df))
+    year = df[col_year].astype(str) if col_year else pd.Series([""] * len(df))
+    title_year_hash = [make_title_year_hash(t, y) for t, y in zip(title, year)]
+
+    record_id = []
+    for d, e, h in zip(doi_norm, eid, title_year_hash):
+        if "doi" in CONFIG["id_priority"] and d:
+            record_id.append("doi:" + d)
+        elif "eid" in CONFIG["id_priority"] and e:
+            record_id.append("eid:" + e)
+        else:
+            record_id.append("hash:" + h)
+
+    out = pd.DataFrame({"record_id": record_id})
+
+    # Standardized fields
+    out[f"{spec.name}__label"] = df[col_label].apply(normalize_label) if col_label else None
+    out[f"{spec.name}__conf"] = df[col_conf] if col_conf else np.nan
+    out[f"{spec.name}__reason"] = df[col_reason].astype(str) if col_reason else ""
+
+    # Keep some metadata if present
+    if col_doi:
+        out["DOI"] = doi_norm
+    if col_title:
+        out["Title"] = df[col_title].astype(str)
+    if col_year:
+        out["Year"] = df[col_year]
+
+    return out
+
+
+# -----------------------------
+# 2) CONSENSUS + FILTERS
+# -----------------------------
+
+def build_human_consensus(df: pd.DataFrame, human_agents: List[str]) -> pd.DataFrame:
+    """
+    Adds:
+      human_majority_label
+      human_majority_votes
+      human_consensus (3-0 / 2-1 / tie / missing)
+      is_highconf (3-0 & 2-1 only)
+    """
+    label_cols = [f"{h}__label" for h in human_agents]
+
+    def row_consensus(row):
+        labels = [row[c] for c in label_cols]
+        labels_clean = [x for x in labels if x is not None and str(x).strip() != ""]
+        n_present = len(labels_clean)
+
+        if CONFIG["require_all_humans_present_for_highconf"] and n_present != len(label_cols):
+            return (None, 0, "missing", False)
+
+        if n_present == 0:
+            return (None, 0, "missing", False)
+
+        vc = pd.Series(labels_clean).value_counts()
+        maj_label = vc.index[0]
+        maj_votes = int(vc.iloc[0])
+
+        # tie (e.g., 1-1-1)
+        if len(vc) > 1 and vc.iloc[0] == vc.iloc[1]:
+            return (None, maj_votes, "tie", False)
+
+        if maj_votes == 3:
+            return (maj_label, 3, "3-0", True)
+        if maj_votes == 2:
+            return (maj_label, 2, "2-1", True)
+        return (maj_label, maj_votes, f"{maj_votes}-{n_present-maj_votes}", False)
+
+    tmp = df.apply(row_consensus, axis=1, result_type="expand")
+    df["human_majority_label"] = tmp[0]
+    df["human_majority_votes"] = tmp[1]
+    df["human_consensus"] = tmp[2]
+    df["is_highconf"] = tmp[3]
+    return df
+
+
+# -----------------------------
+# 3) METRICS
+# -----------------------------
+
+def classification_metrics(y_true: pd.Series, y_pred: pd.Series) -> Dict[str, float]:
+    mask = y_true.notna() & y_pred.notna()
+    y_t = y_true[mask].astype(str)
+    y_p = y_pred[mask].astype(str)
+
+    if len(y_t) == 0:
+        return {"n": 0, "accuracy": np.nan, "macro_f1": np.nan, "kappa": np.nan}
+
+    return {
+        "n": int(len(y_t)),
+        "accuracy": float(accuracy_score(y_t, y_p)),
+        "macro_f1": float(f1_score(y_t, y_p, average="macro")),
+        "kappa": float(cohen_kappa_score(y_t, y_p)),
+    }
+
+
+def pairwise_kappa_matrix(df: pd.DataFrame, agent_names: List[str], subset_mask: pd.Series) -> pd.DataFrame:
+    agents = agent_names[:]
+    mat = pd.DataFrame(index=agents, columns=agents, dtype=float)
+
+    sub = df.loc[subset_mask].copy()
+    for a, b in itertools.product(agents, agents):
+        if a == b:
+            mat.loc[a, b] = 1.0
+            continue
+        ya = sub[f"{a}__label"]
+        yb = sub[f"{b}__label"]
+        mask = ya.notna() & yb.notna()
+        if mask.sum() == 0:
+            mat.loc[a, b] = np.nan
+        else:
+            mat.loc[a, b] = float(cohen_kappa_score(ya[mask].astype(str), yb[mask].astype(str)))
+    return mat
+
+
+# -----------------------------
+# 4) REASONING SIMILARITY
+# -----------------------------
+
+def preprocess_reason(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    t = text.strip()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def build_reason_corpus(df: pd.DataFrame, agent_names: List[str], subset_mask: pd.Series) -> List[str]:
+    corpus = []
+    sub = df.loc[subset_mask]
+    for a in agent_names:
+        col = f"{a}__reason"
+        if col in sub.columns:
+            corpus.extend([preprocess_reason(x) for x in sub[col].fillna("").astype(str).tolist()])
+    # remove empties
+    corpus = [c for c in corpus if c]
+    return corpus
+
+
+def reasoning_similarity_pair(
+    df: pd.DataFrame,
+    a: str,
+    b: str,
+    vectorizer: TfidfVectorizer,
+    subset_mask: pd.Series,
+) -> Tuple[pd.Series, Dict[str, float]]:
+    sub = df.loc[subset_mask].copy()
+    ra = sub[f"{a}__reason"].fillna("").astype(str).apply(preprocess_reason)
+    rb = sub[f"{b}__reason"].fillna("").astype(str).apply(preprocess_reason)
+
+    valid = (ra != "") & (rb != "")
+    sims = pd.Series(np.nan, index=sub.index, dtype=float)
+
+    if valid.sum() == 0:
+        return sims, {"n": 0, "mean": np.nan, "median": np.nan}
+
+    X = vectorizer.transform(ra[valid].tolist())
+    Y = vectorizer.transform(rb[valid].tolist())
+    # cosine similarity row-wise
+    sim_vals = np.array([cosine_similarity(X[i], Y[i])[0, 0] for i in range(X.shape[0])], dtype=float)
+
+    sims.loc[valid] = sim_vals
+    return sims, {
+        "n": int(valid.sum()),
+        "mean": float(np.nanmean(sim_vals)),
+        "median": float(np.nanmedian(sim_vals)),
+    }
+
+
+def composite_similarity(class_agree: pd.Series, reason_sim: pd.Series) -> pd.Series:
+    """
+    Composite in [0,1] (NaNs handled).
+    class_agree: 1 if same label else 0, NaN if missing
+    reason_sim : cosine in [0,1], NaN if missing
+    """
+    wc = CONFIG["w_class"]
+    wr = CONFIG["w_reason"]
+
+    # If one component missing, fall back to the other
+    out = pd.Series(np.nan, index=class_agree.index, dtype=float)
+    both = class_agree.notna() & reason_sim.notna()
+    out.loc[both] = wc * class_agree.loc[both] + wr * reason_sim.loc[both]
+
+    only_c = class_agree.notna() & reason_sim.isna()
+    out.loc[only_c] = class_agree.loc[only_c]
+
+    only_r = class_agree.isna() & reason_sim.notna()
+    out.loc[only_r] = reason_sim.loc[only_r]
+
+    return out
+
+
+# -----------------------------
+# 5) PLOTS
+# -----------------------------
+
+def plot_heatmap(df_mat: pd.DataFrame, title: str, out_path: str):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(df_mat.values, aspect="auto")
+    ax.set_xticks(range(len(df_mat.columns)))
+    ax.set_yticks(range(len(df_mat.index)))
+    ax.set_xticklabels(df_mat.columns, rotation=45, ha="right")
+    ax.set_yticklabels(df_mat.index)
+    ax.set_title(title)
+
+    # annotate
+    for i in range(df_mat.shape[0]):
+        for j in range(df_mat.shape[1]):
+            v = df_mat.values[i, j]
+            s = "" if np.isnan(v) else f"{v:.2f}"
+            ax.text(j, i, s, ha="center", va="center", fontsize=8)
+
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_bar(values: pd.DataFrame, x: str, y: str, title: str, out_path: str):
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.bar(values[x].astype(str), values[y].astype(float))
+    ax.set_title(title)
+    ax.set_xlabel(x)
+    ax.set_ylabel(y)
+    ax.set_xticklabels(values[x].astype(str), rotation=30, ha="right")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+
+def plot_scatter(x: pd.Series, y: pd.Series, title: str, xlabel: str, ylabel: str, out_path: str):
+    fig, ax = plt.subplots(figsize=(7, 5))
+    mask = x.notna() & y.notna()
+    ax.scatter(x[mask], y[mask])
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+
+# -----------------------------
+# 6) MAIN PIPELINE
+# -----------------------------
+
+def main():
+    outdirs = ensure_outdirs(CONFIG["out_dir"])
+
+    # ---- Load all agents ----
+    dfs = []
+    for spec in AGENTS:
+        try:
+            dfs.append(load_agent(spec))
+        except FileNotFoundError as e:
+            print(f"[WARN] {e}  -> skipping agent: {spec.name}")
+
+    if not dfs:
+        raise RuntimeError("No datasets loaded. Check paths in AGENTS[].")
+
+    # Merge on record_id (outer to keep everything)
+    merged = dfs[0]
+    for d in dfs[1:]:
+        merged = merged.merge(d, on="record_id", how="outer", suffixes=("", "_dup"))
+
+    # Remove duplicate metadata columns created by merge
+    dup_cols = [c for c in merged.columns if c.endswith("_dup")]
+    merged.drop(columns=dup_cols, inplace=True, errors="ignore")
+
+    # ---- Identify humans and AIs successfully loaded ----
+    loaded_agent_names = []
+    for spec in AGENTS:
+        if any(c.startswith(spec.name + "__") for c in merged.columns):
+            loaded_agent_names.append(spec.name)
+
+    human_agents = [a.name for a in AGENTS if a.kind == "human" and a.name in loaded_agent_names]
+    ai_agents = [a.name for a in AGENTS if a.kind == "ai" and a.name in loaded_agent_names]
+
+    print("\nLoaded humans:", human_agents)
+    print("Loaded AIs   :", ai_agents)
+
+    if len(human_agents) < 2:
+        raise RuntimeError("Need at least 2 human files loaded to compute consensus/HighConf.")
+
+    # ---- Build human consensus + HighConf ----
+    merged = build_human_consensus(merged, human_agents)
+
+    # Define subsets
+    mask_all = pd.Series(True, index=merged.index)
+    mask_highconf = merged["is_highconf"] == True
+    mask_3_0 = merged["human_consensus"] == "3-0"
+    mask_2_1 = merged["human_consensus"] == "2-1"
+
+    print("\nCounts:")
+    print("  total records:", len(merged))
+    print("  HighConf:", int(mask_highconf.sum()), "| 3-0:", int(mask_3_0.sum()), "| 2-1:", int(mask_2_1.sum()))
+
+    # ---- Human-human agreement (HighConf) ----
+    kappa_hh = pairwise_kappa_matrix(merged, human_agents, mask_highconf)
+    kappa_hh.to_csv(os.path.join(outdirs["tables"], "kappa_human_human_highconf.csv"))
+    plot_heatmap(kappa_hh, "Human–Human Cohen’s κ (HighConf)", os.path.join(outdirs["figs"], "Fig_kappa_human_human_highconf.png"))
+
+    # ---- AI vs Human Majority (HighConf primary) ----
+    rows = []
+    for ai in ai_agents:
+        m = classification_metrics(merged.loc[mask_highconf, "human_majority_label"], merged.loc[mask_highconf, f"{ai}__label"])
+        m["agent"] = ai
+        rows.append(m)
+    ai_vs_cons = pd.DataFrame(rows).sort_values(["kappa", "accuracy"], ascending=False)
+    ai_vs_cons.to_csv(os.path.join(outdirs["tables"], "ai_vs_human_majority_highconf.csv"), index=False)
+
+    plot_bar(
+        ai_vs_cons,
+        x="agent",
+        y="kappa",
+        title="AI vs Human Majority — Cohen’s κ (HighConf)",
+        out_path=os.path.join(outdirs["figs"], "Fig_ai_vs_human_majority_kappa_highconf.png"),
+    )
+    plot_bar(
+        ai_vs_cons,
+        x="agent",
+        y="accuracy",
+        title="AI vs Human Majority — Accuracy (HighConf)",
+        out_path=os.path.join(outdirs["figs"], "Fig_ai_vs_human_majority_accuracy_highconf.png"),
+    )
+
+    # ---- Pairwise kappa across ALL agents (HighConf) ----
+    all_agents = human_agents + ai_agents
+    kappa_all = pairwise_kappa_matrix(merged, all_agents, mask_highconf)
+    kappa_all.to_csv(os.path.join(outdirs["tables"], "kappa_all_agents_highconf.csv"))
+    plot_heatmap(kappa_all, "All Agents Cohen’s κ (HighConf)", os.path.join(outdirs["figs"], "Fig_kappa_all_agents_highconf.png"))
+
+    # ---- Reasoning similarity (TF-IDF cosine) (HighConf) ----
+    corpus = build_reason_corpus(merged, all_agents, mask_highconf)
+    if len(corpus) < 50:
+        print("[WARN] Reason corpus is small; reasoning similarity may be unstable. Consider lowering min_df.")
+    vectorizer = TfidfVectorizer(
+        min_df=CONFIG["tfidf_min_df"],
+        max_features=CONFIG["tfidf_max_features"],
+        ngram_range=CONFIG["tfidf_ngram_range"],
+        stop_words="english",
+    )
+    vectorizer.fit(corpus if corpus else ["placeholder"])
+
+    # Compute pairwise reasoning similarity summary (HighConf)
+    reason_summary = []
+    for a, b in itertools.combinations(all_agents, 2):
+        sims, stats = reasoning_similarity_pair(merged, a, b, vectorizer, mask_highconf)
+        reason_summary.append({"agent_a": a, "agent_b": b, **stats})
+    reason_summary_df = pd.DataFrame(reason_summary).sort_values("mean", ascending=False)
+    reason_summary_df.to_csv(os.path.join(outdirs["tables"], "reason_similarity_pairwise_highconf.csv"), index=False)
+
+    # ---- Composite closeness ranking (classification + reasoning) (HighConf) ----
+    composite_rows = []
+    for a, b in itertools.combinations(all_agents, 2):
+        sub = merged.loc[mask_highconf].copy()
+
+        la = sub[f"{a}__label"]
+        lb = sub[f"{b}__label"]
+        class_agree = (la.notna() & lb.notna() & (la.astype(str) == lb.astype(str))).astype(float)
+        class_agree = class_agree.where(la.notna() & lb.notna(), np.nan)
+
+        reason_sim, _ = reasoning_similarity_pair(merged, a, b, vectorizer, mask_highconf)
+
+        comp = composite_similarity(class_agree, reason_sim)
+        composite_rows.append({
+            "agent_a": a,
+            "agent_b": b,
+            "n_class": int((class_agree.notna()).sum()),
+            "class_agreement_rate": float(np.nanmean(class_agree)),
+            "n_reason": int((reason_sim.notna()).sum()),
+            "reason_mean_cosine": float(np.nanmean(reason_sim)),
+            "composite_mean": float(np.nanmean(comp)),
+        })
+
+    composite_df = pd.DataFrame(composite_rows).sort_values("composite_mean", ascending=False)
+    composite_df.to_csv(os.path.join(outdirs["tables"], "composite_closeness_ranking_highconf.csv"), index=False)
+
+    # Scatter: reasoning vs class agreement for top pair (visual intuition)
+    if len(composite_df) > 0:
+        top = composite_df.iloc[0]
+        a, b = top["agent_a"], top["agent_b"]
+        sub = merged.loc[mask_highconf].copy()
+
+        la = sub[f"{a}__label"]
+        lb = sub[f"{b}__label"]
+        class_agree = (la.notna() & lb.notna() & (la.astype(str) == lb.astype(str))).astype(float)
+        class_agree = class_agree.where(la.notna() & lb.notna(), np.nan)
+
+        reason_sim, _ = reasoning_similarity_pair(merged, a, b, vectorizer, mask_highconf)
+        plot_scatter(
+            x=reason_sim,
+            y=class_agree,
+            title=f"Top Pair: {a} vs {b} — Reasoning Cosine vs Label Agreement (HighConf)",
+            xlabel="Reasoning similarity (cosine)",
+            ylabel="Label agreement (0/1)",
+            out_path=os.path.join(outdirs["figs"], "Fig_top_pair_reason_vs_label_agreement.png"),
+        )
+
+    # ---- AI confidence vs correctness correlation (HighConf) ----
+    # correctness defined vs human majority
+    corr_rows = []
+    for ai in ai_agents:
+        sub = merged.loc[mask_highconf].copy()
+        y_true = sub["human_majority_label"].astype(str)
+        y_pred = sub[f"{ai}__label"].astype(str)
+        correct = (y_true == y_pred).astype(float)
+        conf = pd.to_numeric(sub[f"{ai}__conf"], errors="coerce")
+
+        valid = conf.notna()
+        if valid.sum() >= 10:
+            # Spearman correlation without importing scipy.stats (simple rank corr)
+            conf_rank = conf[valid].rank()
+            corr = conf_rank.corr(correct[valid])
+        else:
+            corr = np.nan
+
+        corr_rows.append({"agent": ai, "n": int(valid.sum()), "spearman_approx": float(corr) if corr == corr else np.nan})
+
+    corr_df = pd.DataFrame(corr_rows).sort_values("spearman_approx", ascending=False)
+    corr_df.to_csv(os.path.join(outdirs["tables"], "ai_confidence_vs_correctness_highconf.csv"), index=False)
+
+    # ---- Save an Excel summary workbook ----
+    xlsx_path = os.path.join(outdirs["base"], "report_summary.xlsx")
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        merged.to_excel(writer, sheet_name="Merged_Data", index=False)
+        ai_vs_cons.to_excel(writer, sheet_name="AI_vs_HumanMajority", index=False)
+        kappa_hh.to_excel(writer, sheet_name="Kappa_HumanHuman")
+        kappa_all.to_excel(writer, sheet_name="Kappa_AllAgents")
+        reason_summary_df.to_excel(writer, sheet_name="Reason_Similarity", index=False)
+        composite_df.to_excel(writer, sheet_name="Composite_Ranking", index=False)
+        corr_df.to_excel(writer, sheet_name="AI_Conf_vs_Correct", index=False)
+
+    print("\nDONE.")
+    print(f"Outputs written to: {os.path.abspath(outdirs['base'])}")
+    print(f"Excel summary: {os.path.abspath(xlsx_path)}")
+
+
+if __name__ == "__main__":
+    main()
